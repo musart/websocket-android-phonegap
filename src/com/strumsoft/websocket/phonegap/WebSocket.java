@@ -35,6 +35,7 @@ import java.nio.channels.NotYetConnectedException;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
+import java.nio.charset.Charset;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Iterator;
@@ -42,6 +43,7 @@ import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.security.MessageDigest;
 
 import android.util.Log;
 import android.webkit.WebView;
@@ -62,7 +64,7 @@ public class WebSocket implements Runnable {
 	 * Enum for WebSocket Draft
 	 */
 	public enum Draft {
-		DRAFT75, DRAFT76
+		DRAFT13, DRAFT75, DRAFT76
 	}
 
 	// //////////////// CONSTANT
@@ -223,6 +225,7 @@ public class WebSocket implements Runnable {
 	 *            unique id for this instance
 	 */
 	protected WebSocket(WebView appView, URI uri, Draft draft, String id) {
+		
 		this.appView = appView;
 		this.uri = uri;
 		this.draft = draft;
@@ -416,12 +419,72 @@ public class WebSocket implements Runnable {
 		}
 
 		// Get 'text' into a WebSocket "frame" of bytes
-		byte[] textBytes = text.getBytes(UTF8_CHARSET.toString());
-		ByteBuffer b = ByteBuffer.allocate(textBytes.length + 2);
-		b.put(DATA_START_OF_FRAME);
-		b.put(textBytes);
-		b.put(DATA_END_OF_FRAME);
-		b.rewind();
+		ByteBuffer b = null;
+		
+		if( (this.draft == WebSocket.Draft.DRAFT75)
+				|| (this.draft == WebSocket.Draft.DRAFT76) ){
+			byte[] textBytes = text.getBytes(UTF8_CHARSET.toString());
+			b = ByteBuffer.allocate(textBytes.length + 2);
+			b.put(DATA_START_OF_FRAME);
+			b.put(textBytes);
+			b.put(DATA_END_OF_FRAME);
+			b.rewind();
+		}
+		else if(this.draft == WebSocket.Draft.DRAFT13) {
+			
+			byte[] textBytes = text.getBytes(UTF8_CHARSET.toString());
+			
+			// start to duplicate code.
+	        
+			// argument of EncodingHybiFrame class's constructor
+			int opcode = 0x1;//Opcodes.OPCODE_TEXT
+			boolean fin = true; //true
+			int rsv = 0; // 0
+			byte[] maskingKey = new byte[] { 0x00, 0x00, 0x00, 0x00};
+			
+			// logic
+			int b0 = 0;
+			if (fin) {
+				b0 |= (1 << 7);
+			}
+			b0 |= (rsv % 8) << 4;
+			b0 |= opcode % 128;
+
+			int b1 = maskingKey != null ? 0x80 : 0x00;
+
+			int headerLength = maskingKey != null ? 6 : 2;
+			int length = textBytes.length;
+
+			if (length <= 125) {
+				b1 |= length & 0x7F;
+				b = ByteBuffer.allocate(headerLength + length);
+				b.put((byte)b0);
+				b.put((byte)b1);
+			} else if (length <= 0xFFFF) {
+				b1 |= 126;
+				headerLength += 2;
+				b = ByteBuffer.allocate(headerLength + length);
+				b.put((byte)b0);
+				b.put((byte)b1);
+				b.put((byte)((length >>> 8) & 0xFF));
+				b.put((byte)((length) & 0xFF));
+			} else {
+				b1 |= 127;
+				headerLength += 8;
+				b = ByteBuffer.allocate(headerLength + length);
+				b.put((byte)b0);
+				b.put((byte)b1);
+				b.put((byte)length);
+			}
+	        
+			if (maskingKey != null) {
+				b.put(maskingKey);
+				//applyMask(data, maskingKey);
+			}
+			// end to duplicate code
+			b.put(textBytes);
+			b.rewind();
+		}
 
 		// See if we have any backlog that needs to be sent first
 		if (_write()) {
@@ -443,7 +506,6 @@ public class WebSocket implements Runnable {
 	// actual connection logic
 	private void _connect() throws IOException {
 		// Continuous loop that is only supposed to end when "close" is called.
-
 		selector.select();
 		Set<SelectionKey> keys = selector.selectedKeys();
 		Iterator<SelectionKey> i = keys.iterator();
@@ -470,16 +532,18 @@ public class WebSocket implements Runnable {
 	}
 
 	private void _writeHandshake() throws IOException {
+		
 		String path = this.uri.getPath();
 		if (path.indexOf("/") != 0) {
 			path = "/" + path;
 		}
 
 		String host = uri.getHost() + (port != DEFAULT_PORT ? ":" + port : "");
-		String origin = "*"; // TODO: Make 'origin' configurable
+		//String origin = "*"; // TODO: Make 'origin' configurable
+		String origin = "http://" + host;
 		String request = "GET " + path + " HTTP/1.1\r\n" + "Upgrade: WebSocket\r\n" + "Connection: Upgrade\r\n"
 				+ "Host: " + host + "\r\n" + "Origin: " + origin + "\r\n";
-
+		
 		// Add random keys for Draft76
 		if (this.draft == Draft.DRAFT76) {
 			request += "Sec-WebSocket-Key1: " + this._randomKey() + "\r\n";
@@ -492,7 +556,7 @@ public class WebSocket implements Runnable {
 			byte[] bRequest = request.getBytes(UTF8_CHARSET);
 
 			byte[] bToSend = new byte[bRequest.length + 8];
-
+			
 			// Copy in the Request bytes
 			System.arraycopy(bRequest, 0, bToSend, 0, bRequest.length);
 
@@ -502,6 +566,10 @@ public class WebSocket implements Runnable {
 			// Now we can send all keys as a single frame
 			_write(bToSend);
 			return;
+		}
+		else if(this.draft == Draft.DRAFT13) {
+			request += "Sec-WebSocket-Key: " + this.base64Nonce() + "\r\n";
+			request += "Sec-WebSocket-Version: 13\r\n";
 		}
 
 		request += "\r\n";
@@ -552,31 +620,61 @@ public class WebSocket implements Runnable {
 	}
 
 	private void _readFrame() throws UnsupportedEncodingException {
-		byte newestByte = this.buffer.get();
+		
+		if( (this.draft == WebSocket.Draft.DRAFT75)
+				|| (this.draft == WebSocket.Draft.DRAFT76) ) {
+			byte newestByte = this.buffer.get();
 
-		if (newestByte == DATA_START_OF_FRAME) { // Beginning of Frame
-			this.currentFrame = null;
+			if (newestByte == DATA_START_OF_FRAME) { // Beginning of Frame
+				this.currentFrame = null;
 
-		} else if (newestByte == DATA_END_OF_FRAME) { // End of Frame
-			String textFrame = null;
-			// currentFrame will be null if END_OF_FRAME was send directly after
-			// START_OF_FRAME, thus we will send 'null' as the sent message.
-			if (this.currentFrame != null) {
-				textFrame = new String(this.currentFrame.array(), UTF8_CHARSET.toString());
+			} else if (newestByte == DATA_END_OF_FRAME) { // End of Frame
+				String textFrame = null;
+				// currentFrame will be null if END_OF_FRAME was send directly after
+				// START_OF_FRAME, thus we will send 'null' as the sent message.
+				if (this.currentFrame != null) {
+					textFrame = new String(this.currentFrame.array(), UTF8_CHARSET.toString());
+				}
+				// fire onMessage method
+				this.onMessage(textFrame);
+
+			} else { // Regular frame data, add to current frame buffer
+				ByteBuffer frame = ByteBuffer.allocate((this.currentFrame != null ? this.currentFrame.capacity() : 0)
+						+ this.buffer.capacity());
+				if (this.currentFrame != null) {
+					this.currentFrame.rewind();
+					frame.put(this.currentFrame);
+				}
+				frame.put(newestByte);
+				this.currentFrame = frame;
 			}
-			// fire onMessage method
-			this.onMessage(textFrame);
-
-		} else { // Regular frame data, add to current frame buffer
-			ByteBuffer frame = ByteBuffer.allocate((this.currentFrame != null ? this.currentFrame.capacity() : 0)
-					+ this.buffer.capacity());
-			if (this.currentFrame != null) {
-				this.currentFrame.rewind();
-				frame.put(this.currentFrame);
-			}
-			frame.put(newestByte);
-			this.currentFrame = frame;
 		}
+		else if(this.draft == WebSocket.Draft.DRAFT13) {
+			byte newestByte = this.buffer.get();
+			
+			if (newestByte == (byte)-127) { // Beginning of Frame
+				this.currentFrame = null;
+			} else { // Regular frame data, add to current frame buffer
+				if (this.currentFrame == null) {
+					// set length of data
+					this.currentFrame = ByteBuffer.allocate(newestByte);
+				}
+				else if (this.currentFrame.capacity() > 0) {
+					this.currentFrame.put(newestByte);
+					
+					if( this.currentFrame.position() == this.currentFrame.capacity() ) {
+						// send byte
+						String textFrame = null;
+						if (this.currentFrame != null) {
+							textFrame = new String(this.currentFrame.array(), UTF8_CHARSET.toString());
+						}
+						// fire onMessage method
+						this.onMessage(textFrame);
+					}
+				}
+			}
+		}
+		
 	}
 
 	private void _readHandshake() throws IOException, NoSuchAlgorithmException {
@@ -589,33 +687,46 @@ public class WebSocket implements Runnable {
 		ch.put(this.buffer);
 		this.remoteHandshake = ch;
 		byte[] h = this.remoteHandshake.array();
-		// If the ByteBuffer contains 16 random bytes, and ends with
-		// 0x0D 0x0A 0x0D 0x0A (or two CRLFs), then the client
-		// handshake is complete for Draft 76 Client.
-		if ((h.length >= 20 && h[h.length - 20] == DATA_CR && h[h.length - 19] == DATA_LF
-				&& h[h.length - 18] == DATA_CR && h[h.length - 17] == DATA_LF)) {
-			_readHandshake(new byte[] { h[h.length - 16], h[h.length - 15], h[h.length - 14], h[h.length - 13],
-					h[h.length - 12], h[h.length - 11], h[h.length - 10], h[h.length - 9], h[h.length - 8],
-					h[h.length - 7], h[h.length - 6], h[h.length - 5], h[h.length - 4], h[h.length - 3],
-					h[h.length - 2], h[h.length - 1] });
+		//Charset.forName(UTF8_CHARSET).decode(h);
+		if( (this.draft == WebSocket.Draft.DRAFT75)
+			|| (this.draft == WebSocket.Draft.DRAFT76) ) {
+			// If the ByteBuffer contains 16 random bytes, and ends with
+			// 0x0D 0x0A 0x0D 0x0A (or two CRLFs), then the client
+			// handshake is complete for Draft 76 Client.
+			if ((h.length >= 20 && h[h.length - 20] == DATA_CR && h[h.length - 19] == DATA_LF
+					&& h[h.length - 18] == DATA_CR && h[h.length - 17] == DATA_LF)) {
+				_readHandshake(new byte[] { h[h.length - 16], h[h.length - 15], h[h.length - 14], h[h.length - 13],
+						h[h.length - 12], h[h.length - 11], h[h.length - 10], h[h.length - 9], h[h.length - 8],
+						h[h.length - 7], h[h.length - 6], h[h.length - 5], h[h.length - 4], h[h.length - 3],
+						h[h.length - 2], h[h.length - 1] });
 
-			// If the ByteBuffer contains 8 random bytes,ends with
-			// 0x0D 0x0A 0x0D 0x0A (or two CRLFs), and the response
-			// contains Sec-WebSocket-Key1 then the client
-			// handshake is complete for Draft 76 Server.
-		} else if ((h.length >= 12 && h[h.length - 12] == DATA_CR && h[h.length - 11] == DATA_LF
-				&& h[h.length - 10] == DATA_CR && h[h.length - 9] == DATA_LF)
-				&& new String(this.remoteHandshake.array(), UTF8_CHARSET).contains("Sec-WebSocket-Key1")) {// ************************
-			_readHandshake(new byte[] { h[h.length - 8], h[h.length - 7], h[h.length - 6], h[h.length - 5],
-					h[h.length - 4], h[h.length - 3], h[h.length - 2], h[h.length - 1] });
+				// If the ByteBuffer contains 8 random bytes,ends with
+				// 0x0D 0x0A 0x0D 0x0A (or two CRLFs), and the response
+				// contains Sec-WebSocket-Key1 then the client
+				// handshake is complete for Draft 76 Server.
+			} else if ((h.length >= 12 && h[h.length - 12] == DATA_CR && h[h.length - 11] == DATA_LF
+					&& h[h.length - 10] == DATA_CR && h[h.length - 9] == DATA_LF)
+					&& new String(this.remoteHandshake.array(), UTF8_CHARSET).contains("Sec-WebSocket-Key1")) {// ************************
+				_readHandshake(new byte[] { h[h.length - 8], h[h.length - 7], h[h.length - 6], h[h.length - 5],
+						h[h.length - 4], h[h.length - 3], h[h.length - 2], h[h.length - 1] });
 
-			// Consider Draft 75, and the Flash Security Policy
-			// Request edge-case.
-		} else if ((h.length >= 4 && h[h.length - 4] == DATA_CR && h[h.length - 3] == DATA_LF
-				&& h[h.length - 2] == DATA_CR && h[h.length - 1] == DATA_LF)
-				&& !(new String(this.remoteHandshake.array(), UTF8_CHARSET).contains("Sec"))
-				|| (h.length == 23 && h[h.length - 1] == 0)) {
-			_readHandshake(null);
+				// Consider Draft 75, and the Flash Security Policy
+				// Request edge-case.
+			} else if ((h.length >= 4 && h[h.length - 4] == DATA_CR && h[h.length - 3] == DATA_LF
+					&& h[h.length - 2] == DATA_CR && h[h.length - 1] == DATA_LF)
+					&& !(new String(this.remoteHandshake.array(), UTF8_CHARSET).contains("Sec"))
+					|| (h.length == 23 && h[h.length - 1] == 0)) {
+				_readHandshake(null);
+			}
+		}
+		else if(this.draft == WebSocket.Draft.DRAFT13) {
+			if (h.length >= 4 && h[h.length - 4] == DATA_CR && h[h.length - 3] == DATA_LF
+					&& h[h.length - 2] == DATA_CR && h[h.length - 1] == DATA_LF) {
+				String response = new String(h, "US-ASCII");
+				_readHandshake(null);
+				
+				//TODO
+			}
 		}
 	}
 
@@ -643,6 +754,11 @@ public class WebSocket implements Runnable {
 				if (expected[i] != handShakeBody[i]) {
 					isConnectionReady = true;
 				}
+			}
+		}
+		else if(this.draft == WebSocket.Draft.DRAFT13) {
+			if (handShakeBody == null) {
+				isConnectionReady = true;
 			}
 		}
 
@@ -686,5 +802,17 @@ public class WebSocket implements Runnable {
 			key = new StringBuilder(key).insert(position, "\u0020").toString();
 		}
 		return key;
+	}
+	
+	private String base64Nonce() {
+		byte[] nonce = new byte[16];
+		for (int i = 0; i < 16; i++) {
+			nonce[i] = randomByte();
+		}
+		return Base64.encode(nonce);
+	}
+
+	private byte randomByte() {
+		return (byte) (Math.random() * 256);
 	}
 }

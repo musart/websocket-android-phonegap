@@ -55,7 +55,8 @@ public class WebSocketFactory {
 
 	public WebSocket getInstance(String url) {
 		// use Draft75 by default
-		return getInstance(url, WebSocket.Draft.DRAFT75);
+		//return getInstance(url, WebSocket.Draft.DRAFT75);
+		return getInstance(url, WebSocket.Draft.DRAFT13);
 	}
 
 	public WebSocket getInstance(String url, WebSocket.Draft draft) {
